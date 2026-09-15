@@ -1,12 +1,16 @@
 import argparse
 import json
 import os
+import sys
 from collections import Counter, defaultdict
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from datasets.data_module import DataModule
 from dp.dp_utils import compute_all_costs
@@ -14,9 +18,7 @@ from dp.exact_dp import drop_dtw
 from models.nets import EmbeddingsMapping
 
 
-DEFAULT_CKPT = (
-    "best_models/drop_dtw_coin/best1_iou_seed40_epoch09.ckpt"
-)
+DEFAULT_CKPT = "weights/drop_dtw_coin/best.ckpt"
 
 
 def scalar_int(value):
@@ -26,12 +28,7 @@ def scalar_int(value):
 
 
 def load_model(args, device):
-    model = EmbeddingsMapping(
-        d=512,
-        learnable_drop=(args.drop_cost == "learn"),
-        video_layers=args.video_layers,
-        text_layers=args.text_layers,
-    )
+    model = EmbeddingsMapping(d=512)
     ckpt = torch.load(args.ckpt, map_location=device)
     state_dict = ckpt["state_dict"]
     state_dict = {
@@ -39,7 +36,23 @@ def load_model(args, device):
         for k, v in state_dict.items()
         if k.startswith("model.")
     }
-    model.load_state_dict(state_dict, strict=True)
+    state_dict = {
+        key: value
+        for key, value in state_dict.items()
+        if not key.startswith("drop_mapping.")
+    }
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    unexpected = [
+        key
+        for key in incompatible.unexpected_keys
+        if not key.startswith("drop_mapping.")
+    ]
+    missing = list(incompatible.missing_keys)
+    if missing or unexpected:
+        raise RuntimeError(
+            "Could not load Drop-DTW checkpoint cleanly: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
     model.to(device)
     model.eval()
     return model
@@ -53,18 +66,9 @@ def infer_assignment(sample, model, args, device):
     work_sample["frame_features"] = frame_features.cpu()
     work_sample["step_features"] = step_features.cpu()
 
-    if args.drop_cost == "learn":
-        distractor = model.compute_distractors(
-            step_features.mean(0).to(device)
-        ).detach().cpu()
-    else:
-        distractor = None
-
     zx_costs, drop_costs, _ = compute_all_costs(
         work_sample,
-        distractor,
         args.gamma,
-        drop_cost_type=args.drop_cost,
         keep_percentile=args.keep_percentile,
     )
     assignment = drop_dtw(
@@ -75,18 +79,9 @@ def infer_assignment(sample, model, args, device):
     return assignment.astype(np.int64), work_sample
 
 
-def map_sample_features(sample, model, device):
-    frame_features = model.map_video(sample["frame_features"].to(device)).detach()
-    step_features = model.map_text(sample["step_features"].to(device)).detach()
-    work_sample = dict(sample)
-    work_sample["frame_features"] = frame_features.cpu()
-    work_sample["step_features"] = step_features.cpu()
-    return work_sample
-
-
 def robust_span_pool(
     mapped_frames,
-    raw_frames,
+    source_frames,
     mapped_step,
     top_fraction=0.6,
     temperature=0.1,
@@ -101,8 +96,8 @@ def robust_span_pool(
     selected_scores, selected = torch.topk(scores, k=keep, largest=True)
     weights = torch.softmax(selected_scores / float(temperature), dim=0)
     mapped_visual = (mapped_frames[selected] * weights.unsqueeze(1)).sum(dim=0)
-    raw_visual = (raw_frames[selected] * weights.unsqueeze(1)).sum(dim=0)
-    return mapped_visual, raw_visual, keep, float(selected_scores.mean())
+    source_visual = (source_frames[selected] * weights.unsqueeze(1)).sum(dim=0)
+    return mapped_visual, source_visual, keep, float(selected_scores.mean())
 
 
 def make_occurrences(dataset, model, args, device):
@@ -115,7 +110,7 @@ def make_occurrences(dataset, model, args, device):
         "gamma": args.gamma,
         "keep_percentile": args.keep_percentile,
         "schema_version": 2,
-        "raw_feature_fields": ["raw_text_feature", "raw_visual_feature"],
+        "source_feature_fields": ["source_text_feature", "source_visual_feature"],
         "visual_pooling": "top_fraction_step_similarity_softmax",
         "visual_pool_top_fraction": args.visual_pool_top_fraction,
         "visual_pool_temperature": args.visual_pool_temperature,
@@ -144,16 +139,12 @@ def make_occurrences(dataset, model, args, device):
         # Keep encoder-input features in the graph-construction records.  The
         # mapped features below belong to the checkpoint used for initial
         # pseudo-labeling and may become stale when the alignment model is
-        # fine-tuned.  Raw prototypes can instead be passed through the current
+        # fine-tuned. Source prototypes can instead be passed through the current
         # video/text mappings when task-memory nodes are formed.
-        raw_frame_features = sample["frame_features"].detach().cpu()
-        raw_step_features = sample["step_features"].detach().cpu()
+        source_frame_features = sample["frame_features"].detach().cpu()
+        source_step_features = sample["step_features"].detach().cpu()
 
-        if args.span_source == "pseudo":
-            assignment, mapped_sample = infer_assignment(sample, model, args, device)
-        else:
-            assignment = None
-            mapped_sample = map_sample_features(sample, model, device)
+        assignment, mapped_sample = infer_assignment(sample, model, args, device)
         num_frames = scalar_int(mapped_sample["num_frames"])
         task_id = scalar_int(mapped_sample["cls"])
         task_name = mapped_sample.get("cls_name", str(task_id))
@@ -164,21 +155,15 @@ def make_occurrences(dataset, model, args, device):
 
         for step_index in range(num_steps):
             step_id = scalar_int(mapped_sample["step_ids"][step_index])
-            if args.span_source == "pseudo":
-                matched_frames = np.where(assignment == step_index)[0]
-                is_matched = matched_frames.size > 0
-                if is_matched:
-                    pseudo_start = int(matched_frames[0])
-                    pseudo_end = int(matched_frames[-1])
-                    aligned_indices = torch.from_numpy(matched_frames).long()
-                else:
-                    pseudo_start = -1
-                    pseudo_end = -1
-                    aligned_indices = None
+            matched_frames = np.where(assignment == step_index)[0]
+            is_matched = matched_frames.size > 0
+            if is_matched:
+                pseudo_start = int(matched_frames[0])
+                pseudo_end = int(matched_frames[-1])
+                aligned_indices = torch.from_numpy(matched_frames).long()
             else:
-                pseudo_start = scalar_int(mapped_sample["step_starts"][step_index])
-                pseudo_end = scalar_int(mapped_sample["step_ends"][step_index])
-                is_matched = pseudo_start >= 0 and pseudo_end >= pseudo_start
+                pseudo_start = -1
+                pseudo_end = -1
                 aligned_indices = None
 
             if is_matched:
@@ -190,15 +175,15 @@ def make_occurrences(dataset, model, args, device):
                     )
                 aligned_indices = aligned_indices.clamp(0, num_frames - 1)
                 span_features = mapped_sample["frame_features"][aligned_indices]
-                raw_span_features = raw_frame_features[aligned_indices]
+                source_span_features = source_frame_features[aligned_indices]
                 (
                     visual_feature,
-                    raw_visual_feature,
+                    source_visual_feature,
                     selected_frame_count,
                     visual_pool_confidence,
                 ) = robust_span_pool(
                     span_features,
-                    raw_span_features,
+                    source_span_features,
                     mapped_sample["step_features"][step_index],
                     top_fraction=args.visual_pool_top_fraction,
                     temperature=args.visual_pool_temperature,
@@ -221,7 +206,7 @@ def make_occurrences(dataset, model, args, device):
                 pseudo_start = -1
                 pseudo_end = -1
                 visual_feature = torch.zeros_like(mapped_sample["frame_features"][0])
-                raw_visual_feature = torch.zeros_like(raw_frame_features[0])
+                source_visual_feature = torch.zeros_like(source_frame_features[0])
                 temporal_feature = torch.tensor([-1.0, -1.0, -1.0])
                 selected_frame_count = 0
                 visual_pool_confidence = 0.0
@@ -245,9 +230,9 @@ def make_occurrences(dataset, model, args, device):
                     "step_id": step_id,
                     "step_text": step_text,
                     "text_feature": mapped_sample["step_features"][step_index].cpu(),
-                    "raw_text_feature": raw_step_features[step_index].cpu(),
+                    "source_text_feature": source_step_features[step_index].cpu(),
                     "visual_feature": visual_feature.cpu(),
-                    "raw_visual_feature": raw_visual_feature.cpu(),
+                    "source_visual_feature": source_visual_feature.cpu(),
                     "temporal_feature": temporal_feature.cpu(),
                     "pseudo_start": pseudo_start,
                     "pseudo_end": pseudo_end,
@@ -272,32 +257,27 @@ def make_occurrences(dataset, model, args, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="COIN", choices=["COIN"])
-    parser.add_argument("--split", default="train", choices=["train", "val", "test"])
     parser.add_argument("--ckpt", default=DEFAULT_CKPT)
-    parser.add_argument("--output_dir", default="tam_outputs/COIN/task_memory")
-    parser.add_argument("--span_source", default="pseudo", choices=["pseudo", "gt"])
-    parser.add_argument("--drop_cost", default="learn", choices=["learn", "logit"])
-    parser.add_argument("--gamma", type=float, default=30.0)
-    parser.add_argument("--keep_percentile", type=float, default=0.3)
-    parser.add_argument("--visual_pool_top_fraction", type=float, default=0.6)
-    parser.add_argument("--visual_pool_temperature", type=float, default=0.1)
-    parser.add_argument("--video_layers", type=int, default=2)
-    parser.add_argument("--text_layers", type=int, default=0)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--n_cls", type=int, default=1)
+    parser.add_argument("--output_dir", default="outputs/coin_memory")
     args = parser.parse_args()
-
-    if not 0.0 < args.visual_pool_top_fraction <= 1.0:
-        parser.error("--visual_pool_top_fraction must be in (0, 1]")
-    if args.visual_pool_temperature <= 0.0:
-        parser.error("--visual_pool_temperature must be positive")
+    args.dataset = "COIN"
+    args.split = "train"
+    args.span_source = "pseudo"
+    args.drop_cost = "logit"
+    args.gamma = 30.0
+    args.keep_percentile = 0.3
+    args.visual_pool_top_fraction = 0.6
+    args.visual_pool_temperature = 0.1
+    args.video_layers = 2
+    args.text_layers = 0
+    args.batch_size = 1
+    args.n_cls = 1
 
     os.makedirs(args.output_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = load_model(args, device)
 
-    data = DataModule(args.dataset, args.n_cls, args.batch_size)
+    data = DataModule(batch_size=args.batch_size, videos_per_task=args.n_cls)
     dataset = getattr(data, f"{args.split}_dataset")
 
     records, summary = make_occurrences(dataset, model, args, device)

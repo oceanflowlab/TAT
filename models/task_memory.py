@@ -1,25 +1,13 @@
-import csv
-
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 
-class BidirectionalCrossAttentionV2(nn.Module):
-    """Light association in Eqs. (21-22), with both branches retained."""
+class BidirectionalCrossAttention(nn.Module):
+    """Bidirectional route/frame association from Eqs. (21-22)."""
 
-    def __init__(
-        self,
-        d=512,
-        nhead=8,
-        dropout=0.1,
-        residual_scale_init=1.0,
-        learnable_residual_scale=False,
-    ):
+    def __init__(self, d=512, nhead=8, dropout=0.1):
         super().__init__()
-        if not 0.0 < residual_scale_init <= 1.0:
-            raise ValueError("residual_scale_init must be in (0, 1]")
         self.route_to_frame = nn.MultiheadAttention(
             d, nhead, dropout=dropout, batch_first=True
         )
@@ -29,41 +17,11 @@ class BidirectionalCrossAttentionV2(nn.Module):
         self.route_dropout = nn.Dropout(dropout)
         self.frame_dropout = nn.Dropout(dropout)
         self.route_norm = nn.LayerNorm(d)
-        self.frame_norm = nn.LayerNorm(d)
-        initial = torch.tensor(float(residual_scale_init))
-        if learnable_residual_scale:
-            # A sigmoid parameterization guarantees that the applied decoder
-            # change never exceeds the standard Transformer candidate.
-            epsilon = 1e-6
-            initial = initial.clamp(epsilon, 1.0 - epsilon)
-            logit = torch.log(initial / (1.0 - initial))
-            self.route_residual_scale_logit = nn.Parameter(logit.clone())
-            self.frame_residual_scale_logit = nn.Parameter(logit.clone())
-        else:
-            self.register_buffer("route_residual_scale", initial.clone())
-            self.register_buffer("frame_residual_scale", initial.clone())
-        self.last_attention_stats = {}
-
-    def residual_scales(self):
-        if hasattr(self, "route_residual_scale_logit"):
-            return (
-                torch.sigmoid(self.route_residual_scale_logit),
-                torch.sigmoid(self.frame_residual_scale_logit),
-            )
-        return self.route_residual_scale, self.frame_residual_scale
-
-    @staticmethod
-    def _attention_stats(weights):
-        # weights: [batch, heads, queries, keys]
-        probabilities = weights.float().clamp_min(1e-12)
-        entropy = -(probabilities * probabilities.log()).sum(dim=-1)
-        key_count = int(probabilities.shape[-1])
-        if key_count > 1:
-            entropy = entropy / probabilities.new_tensor(key_count).log()
-        return {
-            "entropy": entropy.mean().detach(),
-            "max_probability": probabilities.max(dim=-1).values.mean().detach(),
-        }
+        self.frame_query_norm = nn.LayerNorm(d)
+        self.route_key_norm = nn.LayerNorm(d)
+        self.route_value_norm = nn.LayerNorm(d)
+        self.register_buffer("route_residual_scale", torch.tensor(0.1))
+        self.register_buffer("frame_residual_scale", torch.tensor(0.1))
 
     def forward(self, route, frames):
         # Eqs. (21-22) specify the two cross-attention directions.  The paper
@@ -71,84 +29,30 @@ class BidirectionalCrossAttentionV2(nn.Module):
         # standard residual + dropout + LayerNorm wrapper around each
         # attention sublayer.  This preserves input discrimination instead of
         # replacing every feature by a weighted average of the other stream.
-        route_update, route_attention = self.route_to_frame(
+        route_update, _ = self.route_to_frame(
             query=route,
             key=frames,
             value=frames,
-            need_weights=True,
-            average_attn_weights=False,
+            need_weights=False,
         )
-        frame_update, frame_attention = self.frame_to_route(
-            query=frames,
-            key=route,
-            value=route,
-            need_weights=True,
-            average_attn_weights=False,
+        frame_update, _ = self.frame_to_route(
+            query=self.frame_query_norm(frames),
+            key=self.route_key_norm(route),
+            value=self.route_value_norm(route),
+            need_weights=False,
         )
-        route_stats = self._attention_stats(route_attention)
-        frame_stats = self._attention_stats(frame_attention)
-        self.last_attention_stats = {
-            "route_to_frame_entropy": route_stats["entropy"],
-            "route_to_frame_max_probability": route_stats["max_probability"],
-            "frame_to_route_entropy": frame_stats["entropy"],
-            "frame_to_route_max_probability": frame_stats["max_probability"],
-        }
         route_candidate = self.route_norm(
             route + self.route_dropout(route_update)
         )
-        frame_candidate = self.frame_norm(
-            frames + self.frame_dropout(frame_update)
-        )
-        route_scale, frame_scale = self.residual_scales()
+        route_scale = self.route_residual_scale
+        frame_scale = self.frame_residual_scale
         enhanced_route = route + route_scale * (route_candidate - route)
-        enhanced_frames = frames + frame_scale * (frame_candidate - frames)
-        route_denominator = route.detach().norm().clamp_min(1e-8)
-        frame_denominator = frames.detach().norm().clamp_min(1e-8)
-        self.last_attention_stats.update(
-            {
-                "route_residual_scale": route_scale.detach(),
-                "frame_residual_scale": frame_scale.detach(),
-                "route_candidate_delta_ratio": (
-                    (route_candidate - route).detach().norm()
-                    / route_denominator
-                ),
-                "frame_candidate_delta_ratio": (
-                    (frame_candidate - frames).detach().norm()
-                    / frame_denominator
-                ),
-                "route_applied_delta_ratio": (
-                    (enhanced_route - route).detach().norm()
-                    / route_denominator
-                ),
-                "frame_applied_delta_ratio": (
-                    (enhanced_frames - frames).detach().norm()
-                    / frame_denominator
-                ),
-            }
-        )
+        dropped_frame_update = self.frame_dropout(frame_update)
+        enhanced_frames = frames + frame_scale * dropped_frame_update
         return enhanced_route, enhanced_frames
 
 
-class ResidualPredictionMapperV2(nn.Module):
-    """Modality-specific residual mapper used to form Eq. (27) scores."""
-
-    def __init__(self, d=512):
-        super().__init__()
-        self.residual = nn.Sequential(
-            nn.Linear(d, d),
-            nn.ReLU(),
-            nn.Linear(d, d),
-        )
-        # Begin very close to the identity map while keeping both residual
-        # layers trainable on the first backward pass.
-        nn.init.normal_(self.residual[-1].weight, mean=0.0, std=1e-3)
-        nn.init.zeros_(self.residual[-1].bias)
-
-    def forward(self, features):
-        return features + self.residual(features)
-
-
-class ResidualVisualProjectionV2(nn.Module):
+class ResidualVisualProjection(nn.Module):
     """Nonlinear visual adapter that preserves the Drop-DTW input space."""
 
     def __init__(self, d=512, residual_scale=0.1):
@@ -172,7 +76,7 @@ class ResidualVisualProjectionV2(nn.Module):
         return features + self.residual_scale * self.mlp(self.norm(features))
 
 
-class TemporalProjectionV2(nn.Module):
+class TemporalProjection(nn.Module):
     """Nonlinear projection for relative start/end/duration statistics."""
 
     def __init__(self, time_dim=3, hidden_dim=128, d=512):
@@ -194,62 +98,21 @@ class TemporalProjectionV2(nn.Module):
         return self.mlp(temporal)
 
 
-class LightCrossModalDecoderV2(nn.Module):
-    def __init__(
-        self,
-        d=512,
-        nhead=8,
-        num_layers=1,
-        dropout=0.1,
-        prediction_head="direct",
-        residual_scale_init=1.0,
-        learnable_residual_scale=False,
-    ):
+class LightCrossModalDecoder(nn.Module):
+    def __init__(self, d=512, nhead=8, num_layers=1, dropout=0.1):
         super().__init__()
-        if prediction_head not in {"direct", "dual_residual"}:
-            raise ValueError(
-                "prediction_head must be 'direct' or 'dual_residual', got "
-                f"{prediction_head!r}"
-            )
-        self.prediction_head = prediction_head
         self.layers = nn.ModuleList(
             [
-                BidirectionalCrossAttentionV2(d=d, nhead=nhead, dropout=dropout)
-                if not learnable_residual_scale and residual_scale_init == 1.0
-                else BidirectionalCrossAttentionV2(
-                    d=d,
-                    nhead=nhead,
-                    dropout=dropout,
-                    residual_scale_init=residual_scale_init,
-                    learnable_residual_scale=learnable_residual_scale,
-                )
+                BidirectionalCrossAttention(d=d, nhead=nhead, dropout=dropout)
                 for _ in range(num_layers)
             ]
         )
-        # ``direct`` is the paper-faithful control: Eqs. (21-22) feed their
-        # Transformer outputs directly to the prediction loss.  Keep the
-        # modality-specific residual heads only as an explicit ablation.
-        if prediction_head == "dual_residual":
-            self.route_prediction_mapper = ResidualPredictionMapperV2(d=d)
-            self.frame_prediction_mapper = ResidualPredictionMapperV2(d=d)
-        else:
-            self.route_prediction_mapper = nn.Identity()
-            self.frame_prediction_mapper = nn.Identity()
-        self.last_attention_stats = {}
 
     def forward(self, route, frames):
         route = route.unsqueeze(0)
         frames = frames.unsqueeze(0)
         for layer in self.layers:
             route, frames = layer(route, frames)
-        if self.layers:
-            self.last_attention_stats = dict(self.layers[-1].last_attention_stats)
-        if self.prediction_head == "dual_residual":
-            route = self.route_prediction_mapper(route)
-            frames = self.frame_prediction_mapper(frames)
-            prediction_scale = route.shape[-1] ** 0.5
-            route = F.normalize(route, p=2, dim=-1) * prediction_scale
-            frames = F.normalize(frames, p=2, dim=-1) * prediction_scale
         return route.squeeze(0), frames.squeeze(0)
 
 
@@ -261,36 +124,17 @@ class TaskMemory(nn.Module):
     stranded in the feature space of the pseudo-labeling checkpoint.
     """
 
-    def __init__(
-        self,
-        graph_path,
-        assignments_path=None,
-        held_out_tasks_csv=None,
-        d=512,
-        time_dim=3,
-        edge_dim=10,
-        visual_init_weight=0.05,
-        time_init_weight=0.05,
-        multimodal_projection_mode="enhanced",
-        calibrate_fusion_modalities=True,
-        visual_projection_residual_scale=0.1,
-        temporal_projection_hidden_dim=128,
-        train_temporal_prototypes=True,
-        train_temporal_edges=True,
-        decoder_nhead=8,
-        decoder_layers=1,
-        decoder_dropout=0.1,
-        decoder_prediction_head="direct",
-        decoder_residual_scale_init=0.1,
-        learnable_decoder_residual_scale=False,
-        guided_score_temperature=0.02,
-        guided_score_reference_gamma=None,
-        straight_through_retrieval=True,
-        retrieval_temperature=1.0,
-        association_type="light",
-        retriever_log_transition=False,
-        transition_log_epsilon=1e-8,
-    ):
+    @staticmethod
+    def _node_prototype(node, modality):
+        key = modality + "_proto"
+        if key in node:
+            return node[key]
+        legacy_key = "".join(("r", "aw_", key))
+        if legacy_key in node:
+            return node[legacy_key]
+        raise KeyError(key)
+
+    def __init__(self, graph_path, assignments_path, d=512):
         super().__init__()
         payload = torch.load(graph_path, map_location="cpu")
         if int(payload.get("schema_version", 0)) != 2:
@@ -298,51 +142,26 @@ class TaskMemory(nn.Module):
         graphs = {int(task_id): graph for task_id, graph in payload["graphs"].items()}
         self.task_ids = sorted(graphs)
         self.task_to_index = {task_id: index for index, task_id in enumerate(self.task_ids)}
-        self.global_task_id = None
-        self.held_out_to_train = self._load_held_out_mapping(held_out_tasks_csv)
         self.assignment_to_node = self._load_assignments(assignments_path)
-        self.visual_init_weight = float(visual_init_weight)
-        self.time_init_weight = float(time_init_weight)
-        if multimodal_projection_mode != "enhanced":
-            raise ValueError(
-                "multimodal_projection_mode must be 'enhanced'"
-            )
-        self.multimodal_projection_mode = multimodal_projection_mode
-        self.calibrate_fusion_modalities = bool(calibrate_fusion_modalities)
-        self.retriever_log_transition = bool(retriever_log_transition)
-        self.transition_log_epsilon = float(transition_log_epsilon)
-        self.straight_through_retrieval = bool(straight_through_retrieval)
-        self.retrieval_temperature = float(retrieval_temperature)
-        self.guided_score_temperature = float(guided_score_temperature)
-        self.guided_score_reference_gamma = (
-            None
-            if guided_score_reference_gamma is None
-            else float(guided_score_reference_gamma)
-        )
-        if association_type != "light":
-            raise ValueError(
-                "This release keeps only the lightweight TAT association decoder; "
-                f"got association_type={association_type!r}"
-            )
-        self.association_type = association_type
-        if self.retrieval_temperature <= 0:
-            raise ValueError("retrieval_temperature must be positive")
-        if self.transition_log_epsilon <= 0:
-            raise ValueError("transition_log_epsilon must be positive")
-        if self.guided_score_temperature <= 0:
-            raise ValueError("guided_score_temperature must be positive")
-        if (
-            self.guided_score_reference_gamma is not None
-            and self.guided_score_reference_gamma <= 0
-        ):
-            raise ValueError("guided_score_reference_gamma must be positive")
-        self.reset_retriever_stats()
-
+        self.visual_init_weight = 0.05
+        self.time_init_weight = 0.05
+        self.graph_update_max_ratio = 0.75
+        self.retrieval_temperature = 1.0
+        self.guided_score_temperature = 0.02
+        self.retriever_local_candidate_topn = 10
+        self.retriever_local_alignment_temperature = 0.1
+        self.retriever_local_position_sigma = 0.35
+        self.retriever_local_visual_weight = 0.08
+        self.retriever_local_temporal_weight = 0.02
         for task_index, task_id in enumerate(self.task_ids):
             graph = graphs[task_id]
             nodes = sorted(graph["nodes"], key=lambda node: int(node["node_id"]))
-            raw_text = torch.stack([node["raw_text_proto"].float() for node in nodes])
-            raw_visual = torch.stack([node["raw_visual_proto"].float() for node in nodes])
+            source_text = torch.stack(
+                [self._node_prototype(node, "text").float() for node in nodes]
+            )
+            source_visual = torch.stack(
+                [self._node_prototype(node, "visual").float() for node in nodes]
+            )
             temporal = torch.stack([node["temporal_proto"].float() for node in nodes])
             step_ids = torch.tensor(
                 [int(node["canonical_step_id"]) for node in nodes], dtype=torch.long
@@ -354,14 +173,9 @@ class TaskMemory(nn.Module):
                 [float(node["occurrence_rank_normalized_median"]) for node in nodes],
                 dtype=torch.float32,
             )
-            self.register_buffer(f"raw_text_{task_index}", raw_text)
-            self.register_buffer(f"raw_visual_{task_index}", raw_visual)
-            if train_temporal_prototypes:
-                self.register_parameter(
-                    f"temporal_{task_index}", nn.Parameter(temporal)
-                )
-            else:
-                self.register_buffer(f"temporal_{task_index}", temporal)
+            self.register_buffer(f"source_text_{task_index}", source_text)
+            self.register_buffer(f"source_visual_{task_index}", source_visual)
+            self.register_parameter(f"temporal_{task_index}", nn.Parameter(temporal))
             self.register_buffer(f"step_ids_{task_index}", step_ids)
             self.register_buffer(f"support_{task_index}", support)
             self.register_buffer(f"rank_prior_{task_index}", rank_prior)
@@ -393,33 +207,19 @@ class TaskMemory(nn.Module):
             )
             edge_attributes = torch.tensor(edge_attributes, dtype=torch.float32)
             self.register_buffer(f"edge_attr_{task_index}", edge_attributes)
-            if train_temporal_edges:
-                # The four temporal statistics are initialized offline and
-                # refined end-to-end. A residual keeps initialization exact;
-                # the has-temporal mask prevents absent relations appearing.
-                self.register_parameter(
-                    f"edge_temporal_delta_{task_index}",
-                    nn.Parameter(torch.zeros((edge_attributes.shape[0], 4))),
-                )
+            self.register_parameter(
+                f"edge_temporal_delta_{task_index}",
+                nn.Parameter(torch.zeros((edge_attributes.shape[0], 4))),
+            )
 
         self.semantic_proj = nn.Linear(d, d)
-        if self.multimodal_projection_mode == "enhanced":
-            self.visual_proj = ResidualVisualProjectionV2(
-                d=d, residual_scale=visual_projection_residual_scale
-            )
-            self.time_proj = TemporalProjectionV2(
-                time_dim=time_dim,
-                hidden_dim=temporal_projection_hidden_dim,
-                d=d,
-            )
-        else:
-            self.visual_proj = nn.Linear(d, d)
-            self.time_proj = nn.Linear(time_dim, d)
+        self.visual_proj = ResidualVisualProjection(d=d, residual_scale=0.1)
+        self.time_proj = TemporalProjection(time_dim=3, hidden_dim=128, d=d)
         # Eq. (9): modality-specific projections are concatenated and then
         # projected into the d-dimensional node space.
         self.node_fuse = nn.Linear(3 * d, d)
         self.edge_proj = nn.Sequential(
-            nn.Linear(edge_dim, d),
+            nn.Linear(10, d),
             nn.GELU(),
             nn.Linear(d, d),
         )
@@ -430,28 +230,8 @@ class TaskMemory(nn.Module):
         )
         self.edge_message = nn.Linear(d, d)
         self.temporal_ranker = nn.Linear(d, 1, bias=False)
-        self.decoder = LightCrossModalDecoderV2(
-            d=d,
-            nhead=decoder_nhead,
-            num_layers=decoder_layers,
-            dropout=decoder_dropout,
-            prediction_head=decoder_prediction_head,
-            residual_scale_init=decoder_residual_scale_init,
-            learnable_residual_scale=learnable_decoder_residual_scale,
-        )
+        self.decoder = LightCrossModalDecoder(d=d, nhead=8, num_layers=1, dropout=0.1)
         self.reset_parameters()
-
-    @staticmethod
-    def _load_held_out_mapping(path):
-        if not path:
-            return {}
-        with open(path, newline="") as handle:
-            mapping = {}
-            for row in csv.DictReader(handle):
-                nearest = row.get("nearest_train_task_id")
-                if nearest is not None and nearest != "":
-                    mapping[int(row["task_id"])] = int(nearest)
-            return mapping
 
     @staticmethod
     def _load_assignments(path):
@@ -472,14 +252,8 @@ class TaskMemory(nn.Module):
     def reset_parameters(self):
         nn.init.eye_(self.semantic_proj.weight)
         nn.init.zeros_(self.semantic_proj.bias)
-        if self.multimodal_projection_mode == "enhanced":
-            self.visual_proj.reset_parameters()
-            self.time_proj.reset_parameters()
-        else:
-            nn.init.eye_(self.visual_proj.weight)
-            nn.init.zeros_(self.visual_proj.bias)
-            nn.init.xavier_uniform_(self.time_proj.weight)
-            nn.init.zeros_(self.time_proj.bias)
+        self.visual_proj.reset_parameters()
+        self.time_proj.reset_parameters()
         nn.init.zeros_(self.node_fuse.weight)
         nn.init.zeros_(self.node_fuse.bias)
         with torch.no_grad():
@@ -511,11 +285,7 @@ class TaskMemory(nn.Module):
 
     def resolve_task_id(self, task_id):
         task_id = self._as_int(task_id)
-        if self.global_task_id is not None:
-            return self.global_task_id
-        if task_id in self.task_to_index:
-            return task_id
-        return self.held_out_to_train.get(task_id)
+        return task_id if task_id in self.task_to_index else None
 
     def task_index(self, task_id):
         resolved = self.resolve_task_id(task_id)
@@ -523,69 +293,10 @@ class TaskMemory(nn.Module):
             return None
         return self.task_to_index.get(resolved)
 
-    def reset_retriever_stats(self):
-        self.retriever_stats = {
-            "calls": 0,
-            "routes": 0,
-            "positions": 0,
-            "top1_temporal_edge_sum": 0.0,
-            "top1_temporal_edges": 0,
-            "top1_route_score_sum": 0.0,
-            "non_same_step_positions": 0,
-            "selected_semantic_score_sum": 0.0,
-            "selected_visual_score_sum": 0.0,
-            "selected_node_score_sum": 0.0,
-            "visual_oracle_positions": 0,
-            "visual_oracle_top1_hits": 0,
-            "visual_oracle_topk_hits": 0,
-            "oracle_visual_score_sum": 0.0,
-            "visual_oracle_gap_sum": 0.0,
-            "unique_top1_nodes_sum": 0.0,
-            "graph_update_ratio_sum": 0.0,
-            "graph_local_cosine_sum": 0.0,
-            "route_input_norm_sum": 0.0,
-            "frame_input_norm_sum": 0.0,
-            "route_output_norm_sum": 0.0,
-            "frame_output_norm_sum": 0.0,
-            "route_step_delta_sum": 0.0,
-            "frame_delta_sum": 0.0,
-            "decoded_similarity_mean_sum": 0.0,
-            "decoded_similarity_std_sum": 0.0,
-            "decoder_calls": 0,
-            "route_to_frame_attention_entropy_sum": 0.0,
-            "route_to_frame_attention_max_probability_sum": 0.0,
-            "frame_to_route_attention_entropy_sum": 0.0,
-            "frame_to_route_attention_max_probability_sum": 0.0,
-            "vlm_similarity_mean_sum": 0.0,
-            "vlm_similarity_std_sum": 0.0,
-            "vlm_precontext_similarity_mean_sum": 0.0,
-            "vlm_precontext_similarity_std_sum": 0.0,
-            "vlm_route_token_std_sum": 0.0,
-            "vlm_frame_token_std_sum": 0.0,
-            "route_residual_scale_sum": 0.0,
-            "frame_residual_scale_sum": 0.0,
-            "route_candidate_delta_ratio_sum": 0.0,
-            "frame_candidate_delta_ratio_sum": 0.0,
-            "route_applied_delta_ratio_sum": 0.0,
-            "frame_applied_delta_ratio_sum": 0.0,
-            "semantic_projected_norm_sum": 0.0,
-            "visual_projected_norm_sum": 0.0,
-            "time_projected_norm_sum": 0.0,
-            "semantic_fusion_contribution_norm_sum": 0.0,
-            "visual_fusion_contribution_norm_sum": 0.0,
-            "time_fusion_contribution_norm_sum": 0.0,
-            "local_node_norm_sum": 0.0,
-        }
-
-    def pop_retriever_stats(self):
-        stats = dict(self.retriever_stats)
-        self.reset_retriever_stats()
-        return stats
-
     def task_buffers(self, task_index):
         return (
-            getattr(self, f"raw_text_{task_index}"),
-            getattr(self, f"raw_visual_{task_index}"),
+            getattr(self, f"source_text_{task_index}"),
+            getattr(self, f"source_visual_{task_index}"),
             getattr(self, f"temporal_{task_index}"),
             getattr(self, f"step_ids_{task_index}"),
             getattr(self, f"support_{task_index}"),
@@ -625,67 +336,33 @@ class TaskMemory(nn.Module):
         text_mapper,
         video_mapper,
         propagate=True,
-        ablate_node_modality=None,
     ):
-        if ablate_node_modality not in {None, "semantic", "visual", "time"}:
-            raise ValueError(
-                "ablate_node_modality must be semantic, visual, time or None"
-            )
         task_index = self.task_index(task_id)
         if task_index is None:
             return None
-        raw_text, raw_visual, temporal, step_ids, support = self.task_buffers(task_index)
+        source_text, source_visual, temporal, step_ids, support = self.task_buffers(task_index)
         # Eq. (9) constructs a d-dimensional node in the shared encoder
         # space.  Cosine normalization belongs only to Eq. (18) scoring; it
         # must not force the node passed to message passing/association to
         # unit norm.
-        semantic_raw = self.semantic_proj(text_mapper(raw_text))
-        visual_raw = self.visual_proj(video_mapper(raw_visual))
-        time_raw = self.time_proj(temporal)
-        if self.calibrate_fusion_modalities:
-            # Preserve the semantic branch exactly while giving visual and
-            # temporal projections a common reference scale before Eq. (9).
-            # Detaching the reference norm prevents an artificial gradient
-            # from either auxiliary modality into the semantic magnitude.
-            semantic_norm = semantic_raw.detach().norm(dim=1, keepdim=True)
-            fusion_visual_raw = F.normalize(visual_raw, p=2, dim=1) * semantic_norm
-            fusion_time_raw = F.normalize(time_raw, p=2, dim=1) * semantic_norm
-        else:
-            fusion_visual_raw = visual_raw
-            fusion_time_raw = time_raw
-        fusion_semantic = (
-            torch.zeros_like(semantic_raw)
-            if ablate_node_modality == "semantic"
-            else semantic_raw
+        semantic_projected = self.semantic_proj(text_mapper(source_text))
+        visual_projected = self.visual_proj(video_mapper(source_visual))
+        time_projected = self.time_proj(temporal)
+        semantic_norm = semantic_projected.detach().norm(dim=1, keepdim=True)
+        fusion_visual_projected = (
+            F.normalize(visual_projected, p=2, dim=1) * semantic_norm
         )
-        fusion_visual = (
-            torch.zeros_like(fusion_visual_raw)
-            if ablate_node_modality == "visual"
-            else fusion_visual_raw
-        )
-        fusion_time = (
-            torch.zeros_like(fusion_time_raw)
-            if ablate_node_modality == "time"
-            else fusion_time_raw
+        fusion_time_projected = (
+            F.normalize(time_projected, p=2, dim=1) * semantic_norm
         )
         concatenated = torch.cat(
-            [fusion_semantic, fusion_visual, fusion_time], dim=1
+            [semantic_projected, fusion_visual_projected, fusion_time_projected],
+            dim=1,
         )
         local_nodes = self.node_fuse(concatenated)
-        d = semantic_raw.shape[1]
-        fuse_weight = self.node_fuse.weight
-        semantic_contribution = F.linear(
-            semantic_raw, fuse_weight[:, :d], bias=None
-        )
-        visual_contribution = F.linear(
-            fusion_visual_raw, fuse_weight[:, d : 2 * d], bias=None
-        )
-        time_contribution = F.linear(
-            fusion_time_raw, fuse_weight[:, 2 * d :], bias=None
-        )
-        semantic = F.normalize(semantic_raw, p=2, dim=1)
-        visual = F.normalize(visual_raw, p=2, dim=1)
-        time = F.normalize(time_raw, p=2, dim=1)
+        semantic = F.normalize(semantic_projected, p=2, dim=1)
+        visual = F.normalize(visual_projected, p=2, dim=1)
+        time = F.normalize(time_projected, p=2, dim=1)
         refined_nodes = (
             self.propagate(task_index, local_nodes) if propagate else local_nodes
         )
@@ -695,14 +372,11 @@ class TaskMemory(nn.Module):
             "semantic": semantic,
             "visual": visual,
             "time": time,
-            "semantic_raw": semantic_raw,
-            "visual_raw": visual_raw,
-            "time_raw": time_raw,
-            "visual_fusion_input": fusion_visual_raw,
-            "time_fusion_input": fusion_time_raw,
-            "semantic_contribution": semantic_contribution,
-            "visual_contribution": visual_contribution,
-            "time_contribution": time_contribution,
+            "semantic_projected": semantic_projected,
+            "visual_projected": visual_projected,
+            "time_projected": time_projected,
+            "visual_fusion_input": fusion_visual_projected,
+            "time_fusion_input": fusion_time_projected,
             "local_nodes": local_nodes,
             "nodes": refined_nodes,
             "step_ids": step_ids,
@@ -726,6 +400,11 @@ class TaskMemory(nn.Module):
         messages = self.edge_message(nodes[source]) * weights.unsqueeze(1)
         aggregate = torch.zeros_like(nodes)
         aggregate.index_add_(0, target, messages)
+        if self.graph_update_max_ratio > 0:
+            node_norm = nodes.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            update_norm = aggregate.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            max_update_norm = self.graph_update_max_ratio * node_norm
+            aggregate = aggregate * (max_update_norm / update_norm).clamp(max=1.0)
         # Eq. (10): u_tilde_j = u_j + sum_i alpha_{i->j} W_e u_i.
         return nodes + aggregate
 
@@ -736,16 +415,10 @@ class TaskMemory(nn.Module):
         matrix = edge_attributes.new_zeros((node_count, node_count))
         if dtype is not None:
             matrix = matrix.to(dtype=dtype)
-        if self.retriever_log_transition:
-            matrix.fill_(float(np.log(self.transition_log_epsilon)))
         if edge_index.numel() > 0:
             source, target = edge_index[:, 0], edge_index[:, 1]
             # Eq. (19) uses the temporal transition probability.
             probabilities = edge_attributes[:, 2].to(matrix.dtype)
-            if self.retriever_log_transition:
-                probabilities = probabilities.clamp_min(
-                    self.transition_log_epsilon
-                ).log()
             matrix[source, target] = probabilities
         return matrix
 
@@ -754,29 +427,18 @@ class TaskMemory(nn.Module):
         sample,
         text_mapper,
         video_mapper,
-        topk=5,
-        beam_size=20,
-        mu=0.5,
-        gamma=1.0,
-        sample_features_are_mapped=False,
-        propagate_nodes=True,
-        ablate_node_modality=None,
     ):
         """Retrieve top-k routes using Eqs. (18-20)."""
         encoded = self.encode_task_nodes(
             sample["cls"],
             text_mapper,
             video_mapper,
-            propagate=propagate_nodes,
-            ablate_node_modality=ablate_node_modality,
+            propagate=True,
         )
         if encoded is None:
             return None
         mapped_step_features = sample["step_features"]
         mapped_frame_features = sample["frame_features"]
-        if not sample_features_are_mapped:
-            mapped_step_features = text_mapper(mapped_step_features)
-            mapped_frame_features = video_mapper(mapped_frame_features)
         # Eq. (18) uses cosine-normalized scoring views.  Eqs. (21-22) must
         # still receive the unnormalized encoder output X^v, not this view.
         step_score_features = F.normalize(
@@ -787,13 +449,89 @@ class TaskMemory(nn.Module):
         )
 
         semantic_scores = step_score_features @ encoded["semantic"].transpose(0, 1)
-        visual_scores = frame_score_features @ encoded["visual"].transpose(0, 1)
-        visual_scores = visual_scores.max(dim=0).values
-        if ablate_node_modality == "semantic":
-            semantic_scores = torch.zeros_like(semantic_scores)
-        if ablate_node_modality == "visual":
-            visual_scores = torch.zeros_like(visual_scores)
-        node_scores = semantic_scores + float(mu) * visual_scores.unsqueeze(0)
+        frame_node_scores = (
+            frame_score_features @ encoded["visual"].transpose(0, 1)
+        )
+        route_length = int(step_score_features.shape[0])
+        frame_count = int(frame_score_features.shape[0])
+        step_view = F.normalize(mapped_step_features, p=2, dim=1)
+        frame_view = F.normalize(mapped_frame_features, p=2, dim=1)
+        alignment_logits = (
+            step_view @ frame_view.transpose(0, 1)
+        ) / self.retriever_local_alignment_temperature
+        frame_positions = (
+            torch.arange(
+                frame_count,
+                device=alignment_logits.device,
+                dtype=alignment_logits.dtype,
+            )
+            + 0.5
+        ) / max(frame_count, 1)
+        if route_length == 1:
+            expected_positions = alignment_logits.new_tensor([0.5])
+        else:
+            expected_positions = torch.linspace(
+                0.0,
+                1.0,
+                route_length,
+                device=alignment_logits.device,
+                dtype=alignment_logits.dtype,
+            )
+        position_delta = (
+            frame_positions.unsqueeze(0) - expected_positions.unsqueeze(1)
+        ) / self.retriever_local_position_sigma
+        alignment_logits = alignment_logits - 0.5 * position_delta.square()
+        local_alignment_weights = torch.softmax(alignment_logits, dim=1)
+        visual_scores = local_alignment_weights @ frame_node_scores
+
+        node_temporal = getattr(self, f"temporal_{encoded['task_index']}").to(
+            dtype=visual_scores.dtype
+        )
+        node_center = 0.5 * (node_temporal[:, 0] + node_temporal[:, 1])
+        node_duration = node_temporal[:, 2].clamp_min(0.0)
+        visual_center = local_alignment_weights @ frame_positions
+        query_center = 0.5 * visual_center + 0.5 * expected_positions
+        query_duration = visual_scores.new_full(
+            (route_length,), 1.0 / max(route_length, 1)
+        )
+        center_similarity = torch.exp(
+            -0.5
+            * (
+                (query_center.unsqueeze(1) - node_center.unsqueeze(0))
+                / self.retriever_local_position_sigma
+            ).square()
+        )
+        duration_scale = max(1.0 / max(route_length, 1), 0.1)
+        duration_similarity = torch.exp(
+            -0.5
+            * (
+                (query_duration.unsqueeze(1) - node_duration.unsqueeze(0))
+                / duration_scale
+            ).square()
+        )
+        temporal_position_scores = 0.75 * center_similarity + 0.25 * duration_similarity
+
+        gate_k = min(self.retriever_local_candidate_topn, semantic_scores.shape[1])
+        _, gate_nodes = torch.topk(semantic_scores, k=gate_k, dim=1)
+        gate_mask = torch.zeros_like(semantic_scores, dtype=torch.bool)
+        gate_mask.scatter_(1, gate_nodes, True)
+
+        def bounded_candidate_residual(scores):
+            mask = gate_mask.to(scores.dtype)
+            count = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+            mean = (scores * mask).sum(dim=1, keepdim=True) / count
+            variance = ((scores - mean).square() * mask).sum(dim=1, keepdim=True) / count
+            scale = variance.sqrt().clamp_min(0.05)
+            return torch.tanh((scores - mean) / scale)
+
+        node_scores = (
+            semantic_scores
+            + self.retriever_local_visual_weight
+            * bounded_candidate_residual(visual_scores)
+            + self.retriever_local_temporal_weight
+            * bounded_candidate_residual(temporal_position_scores)
+        )
+        node_scores = node_scores.masked_fill(~gate_mask, -1.0e4)
         temporal_matrix = self.temporal_relation_matrix(
             encoded["task_index"], dtype=node_scores.dtype
         )
@@ -801,7 +539,10 @@ class TaskMemory(nn.Module):
         route_length, node_count = node_scores.shape
         if route_length == 0 or node_count == 0:
             return None
-        keep = min(max(int(beam_size), int(topk)), node_count)
+        topk = 5
+        beam_size = 20
+        gamma = 0.78
+        keep = min(max(beam_size, topk), node_count)
         beam_scores, first_nodes = torch.topk(node_scores[0], k=keep)
         beam_routes = first_nodes.unsqueeze(1)
         for position in range(1, route_length):
@@ -833,125 +574,18 @@ class TaskMemory(nn.Module):
             ),
         )
 
-        if self.straight_through_retrieval:
-            # Forward: exactly the hard top-k average in Eq. (20).
-            # Backward: a sequential soft relaxation carries L_U gradients
-            # into the semantic/visual node scores and temporal edge scores.
-            soft_weights = []
-            previous = None
-            temperature = self.retrieval_temperature
-            for position in range(route_length):
-                logits = node_scores[position]
-                if previous is not None:
-                    expected_temporal = previous @ temporal_matrix
-                    logits = logits + float(gamma) * expected_temporal
-                current = torch.softmax(logits / temperature, dim=0)
-                soft_weights.append(current)
-                previous = current
-            soft_weights = torch.stack(soft_weights)
-            route_weights = (
-                hard_route_weights - soft_weights.detach() + soft_weights
-            )
-        else:
-            soft_weights = None
-            route_weights = hard_route_weights
+        soft_weights = []
+        previous = None
+        for position in range(route_length):
+            logits = node_scores[position]
+            if previous is not None:
+                logits = logits + gamma * (previous @ temporal_matrix)
+            current = torch.softmax(logits / self.retrieval_temperature, dim=0)
+            soft_weights.append(current)
+            previous = current
+        soft_weights = torch.stack(soft_weights)
+        route_weights = hard_route_weights - soft_weights.detach() + soft_weights
         fused_route = route_weights @ encoded["nodes"]
-        graph_update_ratio = (
-            (encoded["nodes"] - encoded["local_nodes"]).norm()
-            / encoded["local_nodes"].norm().clamp_min(1e-8)
-        )
-        graph_local_cosine = F.cosine_similarity(
-            encoded["nodes"], encoded["local_nodes"], dim=1
-        )
-        self.retriever_stats["calls"] += 1
-        self.retriever_stats["routes"] += int(route_count)
-        self.retriever_stats["positions"] += int(route_length)
-        self.retriever_stats["top1_route_score_sum"] += float(
-            route_scores[0].detach().cpu()
-        )
-        top1_route = routes[0]
-        positions = torch.arange(route_length, device=routes.device)
-        selected_semantic = semantic_scores[positions, top1_route]
-        selected_visual = visual_scores[top1_route]
-        selected_node = node_scores[positions, top1_route]
-        self.retriever_stats["selected_semantic_score_sum"] += float(
-            selected_semantic.detach().sum().cpu()
-        )
-        self.retriever_stats["selected_visual_score_sum"] += float(
-            selected_visual.detach().sum().cpu()
-        )
-        self.retriever_stats["selected_node_score_sum"] += float(
-            selected_node.detach().sum().cpu()
-        )
-        input_step_ids = sample.get("step_ids")
-        if input_step_ids is not None and int(input_step_ids.numel()) == route_length:
-            input_step_ids = input_step_ids.to(encoded["step_ids"].device).long()
-            self.retriever_stats["non_same_step_positions"] += int(
-                (encoded["step_ids"][top1_route] != input_step_ids).sum().detach().cpu()
-            )
-        self.retriever_stats["unique_top1_nodes_sum"] += float(
-            torch.unique(top1_route).numel()
-        )
-        self.retriever_stats["graph_update_ratio_sum"] += float(
-            graph_update_ratio.detach().cpu()
-        )
-        self.retriever_stats["graph_local_cosine_sum"] += float(
-            graph_local_cosine.mean().detach().cpu()
-        )
-        for key, tensor in (
-            ("semantic_projected_norm_sum", encoded["semantic_raw"]),
-            ("visual_projected_norm_sum", encoded["visual_raw"]),
-            ("time_projected_norm_sum", encoded["time_raw"]),
-            (
-                "semantic_fusion_contribution_norm_sum",
-                encoded["semantic_contribution"],
-            ),
-            (
-                "visual_fusion_contribution_norm_sum",
-                encoded["visual_contribution"],
-            ),
-            ("time_fusion_contribution_norm_sum", encoded["time_contribution"]),
-            ("local_node_norm_sum", encoded["local_nodes"]),
-        ):
-            self.retriever_stats[key] += float(
-                tensor.norm(dim=1).mean().detach().cpu()
-            )
-
-        starts = sample.get("step_starts")
-        ends = sample.get("step_ends")
-        if starts is not None and ends is not None:
-            frame_count = int(frame_score_features.shape[0])
-            for position in range(route_length):
-                start = max(0, min(self._as_int(starts[position]), frame_count - 1))
-                end = max(start, min(self._as_int(ends[position]), frame_count - 1))
-                gt_scores = (
-                    frame_score_features[start : end + 1]
-                    @ encoded["visual"].transpose(0, 1)
-                ).max(dim=0).values
-                oracle = int(torch.argmax(gt_scores).detach().cpu())
-                selected = int(top1_route[position].detach().cpu())
-                topk_at_position = routes[:, position]
-                self.retriever_stats["visual_oracle_positions"] += 1
-                self.retriever_stats["visual_oracle_top1_hits"] += int(selected == oracle)
-                self.retriever_stats["visual_oracle_topk_hits"] += int(
-                    bool((topk_at_position == oracle).any().detach().cpu())
-                )
-                selected_gt_score = gt_scores[selected]
-                oracle_gt_score = gt_scores[oracle]
-                self.retriever_stats["oracle_visual_score_sum"] += float(
-                    oracle_gt_score.detach().cpu()
-                )
-                self.retriever_stats["visual_oracle_gap_sum"] += float(
-                    (oracle_gt_score - selected_gt_score).detach().cpu()
-                )
-        if route_length > 1:
-            top_temporal = temporal_matrix[routes[0, :-1], routes[0, 1:]]
-            self.retriever_stats["top1_temporal_edge_sum"] += float(
-                top_temporal.detach().sum().cpu()
-            )
-            self.retriever_stats["top1_temporal_edges"] += int(
-                top_temporal.numel()
-            )
         return {
             "input_task_id": self._as_int(sample["cls"]),
             "resolved_task_id": encoded["task_id"],
@@ -964,13 +598,11 @@ class TaskMemory(nn.Module):
             "route_step_ids": encoded["step_ids"][routes],
             "semantic_scores": semantic_scores,
             "visual_scores": visual_scores,
+            "temporal_position_scores": temporal_position_scores,
+            "local_alignment_weights": local_alignment_weights,
             "node_scores": node_scores,
             "temporal_matrix": temporal_matrix,
-            "mu": float(mu),
             "gamma": float(gamma),
-            "graph_update_ratio": graph_update_ratio,
-            "graph_local_cosine_mean": graph_local_cosine.mean(),
-            "graph_local_cosine_min": graph_local_cosine.min(),
             "mapped_step_features": mapped_step_features,
             "mapped_frame_features": mapped_frame_features,
         }
@@ -980,93 +612,17 @@ class TaskMemory(nn.Module):
         sample,
         text_mapper,
         video_mapper,
-        topk=5,
-        beam_size=20,
-        mu=0.5,
-        gamma=1.0,
-        sample_features_are_mapped=False,
-        propagate_nodes=True,
-        ablate_node_modality=None,
     ):
-        retrieval = self.retrieve_routes(
-            sample,
-            text_mapper,
-            video_mapper,
-            topk=topk,
-            beam_size=beam_size,
-            mu=mu,
-            gamma=gamma,
-            sample_features_are_mapped=sample_features_are_mapped,
-            propagate_nodes=propagate_nodes,
-            ablate_node_modality=ablate_node_modality,
-        )
+        retrieval = self.retrieve_routes(sample, text_mapper, video_mapper)
         if retrieval is None:
             return None
         decoded_route, decoded_frames = self.decoder(
             retrieval["fused_route"], retrieval["mapped_frame_features"]
         )
-        stats = self.retriever_stats
-        stats["decoder_calls"] += 1
-        attention_stats = self.decoder.last_attention_stats
-        attention_stat_keys = {
-            "route_to_frame_entropy": "route_to_frame_attention_entropy_sum",
-            "route_to_frame_max_probability": "route_to_frame_attention_max_probability_sum",
-            "frame_to_route_entropy": "frame_to_route_attention_entropy_sum",
-            "frame_to_route_max_probability": "frame_to_route_attention_max_probability_sum",
-            "vlm_similarity_mean": "vlm_similarity_mean_sum",
-            "vlm_similarity_std": "vlm_similarity_std_sum",
-            "vlm_precontext_similarity_mean": "vlm_precontext_similarity_mean_sum",
-            "vlm_precontext_similarity_std": "vlm_precontext_similarity_std_sum",
-            "vlm_route_token_std": "vlm_route_token_std_sum",
-            "vlm_frame_token_std": "vlm_frame_token_std_sum",
-            "route_residual_scale": "route_residual_scale_sum",
-            "frame_residual_scale": "frame_residual_scale_sum",
-            "route_candidate_delta_ratio": "route_candidate_delta_ratio_sum",
-            "frame_candidate_delta_ratio": "frame_candidate_delta_ratio_sum",
-            "route_applied_delta_ratio": "route_applied_delta_ratio_sum",
-            "frame_applied_delta_ratio": "frame_applied_delta_ratio_sum",
-        }
-        for decoder_key, accumulator_key in attention_stat_keys.items():
-            value = attention_stats.get(decoder_key)
-            if value is not None:
-                stats[accumulator_key] += float(value.detach().cpu())
-        stats["route_input_norm_sum"] += float(
-            retrieval["fused_route"].norm(dim=1).mean().detach().cpu()
-        )
-        stats["frame_input_norm_sum"] += float(
-            retrieval["mapped_frame_features"].norm(dim=1).mean().detach().cpu()
-        )
-        stats["route_output_norm_sum"] += float(
-            decoded_route.norm(dim=1).mean().detach().cpu()
-        )
-        stats["frame_output_norm_sum"] += float(
-            decoded_frames.norm(dim=1).mean().detach().cpu()
-        )
-        if retrieval["mapped_step_features"].shape == decoded_route.shape:
-            stats["route_step_delta_sum"] += float(
-                (decoded_route - retrieval["mapped_step_features"])
-                .norm(dim=1)
-                .mean()
-                .detach()
-                .cpu()
-            )
-        stats["frame_delta_sum"] += float(
-            (decoded_frames - retrieval["mapped_frame_features"])
-            .norm(dim=1)
-            .mean()
-            .detach()
-            .cpu()
-        )
         decoded_similarity = (
             F.normalize(decoded_route, p=2, dim=1)
             @ F.normalize(decoded_frames, p=2, dim=1).transpose(0, 1)
         ) / self.guided_score_temperature
-        stats["decoded_similarity_mean_sum"] += float(
-            decoded_similarity.mean().detach().cpu()
-        )
-        stats["decoded_similarity_std_sum"] += float(
-            decoded_similarity.std().detach().cpu()
-        )
         enhanced_sample = dict(sample)
         enhanced_sample["step_features"] = decoded_route
         enhanced_sample["frame_features"] = decoded_frames
@@ -1077,10 +633,6 @@ class TaskMemory(nn.Module):
         enhanced_sample["pairwise_score_temperature"] = (
             self.guided_score_temperature
         )
-        if self.guided_score_reference_gamma is not None:
-            enhanced_sample["pairwise_score_reference_gamma"] = (
-                self.guided_score_reference_gamma
-            )
         return {
             "sample": enhanced_sample,
             "retrieval": retrieval,
@@ -1125,9 +677,6 @@ class TaskMemory(nn.Module):
         samples,
         text_mapper,
         video_mapper,
-        lambda_temporal=0.5,
-        margin=1.0,
-        sample_text_is_mapped=False,
     ):
         """Original MCL: L_mem = L_sem + lambda * L_temp (Eqs. 14-17).
 
@@ -1136,12 +685,13 @@ class TaskMemory(nn.Module):
         repeated steps and non-canonical execution routes.
         """
         semantic_losses = []
-        local_semantic_diagnostics = []
+        refined_semantic_diagnostics = []
         temporal_losses = []
         encoded_tasks = {}
         selected_nodes = 0
         assignment_hits = 0
         temporal_pairs = 0
+        temporal_skipped_same_node_pairs = 0
         for sample in samples:
             requested_task = self._as_int(sample["cls"])
             if requested_task not in encoded_tasks:
@@ -1164,43 +714,49 @@ class TaskMemory(nn.Module):
                 dtype=torch.long,
                 device=encoded["local_nodes"].device,
             )
-            # Sec. 3.5.5 optimizes the memory after Sec. 3.5.4 graph
-            # propagation.  Eq. (14) therefore anchors the graph-refined
-            # memory node that is actually consumed by retrieval/alignment.
-            # Keeping L_sem on the pre-propagation node would leave the
-            # retrieved node free to drift under message passing.
+            # Eqs. (9-10) distinguish the fused local node u from the
+            # graph-refined node u_tilde. Eqs. (14-16) explicitly constrain u.
             local_route_nodes = encoded["local_nodes"][node_ids]
             refined_route_nodes = encoded["nodes"][node_ids]
             sample_text = sample["step_features"][positions]
-            if not sample_text_is_mapped:
-                sample_text = text_mapper(sample_text)
             # Eq. (14) is squared L2 in the shared embedding space.  Do not
             # replace it with a normalized/cosine surrogate.
             semantic_target = self.semantic_proj(sample_text)
             semantic_losses.append(
-                (refined_route_nodes - semantic_target).square().sum(dim=1).mean()
+                (local_route_nodes - semantic_target).square().sum(dim=1).mean()
             )
-            # Diagnostic only: this is deliberately excluded from L_mem.
-            local_semantic_diagnostics.append(
-                (local_route_nodes - semantic_target)
+            # Monitor graph drift without pulling the graph update back into
+            # the text anchor; this value is deliberately excluded from L_mem.
+            refined_semantic_diagnostics.append(
+                (refined_route_nodes - semantic_target)
                 .square()
                 .sum(dim=1)
                 .mean()
                 .detach()
             )
 
-            if refined_route_nodes.shape[0] > 1:
-                tau = self.temporal_ranker(refined_route_nodes).squeeze(1)
+            if local_route_nodes.shape[0] > 1:
+                tau = self.temporal_ranker(local_route_nodes).squeeze(1)
                 pair_index = torch.triu_indices(
                     tau.numel(), tau.numel(), offset=1, device=tau.device
                 )
-                temporal_losses.append(
-                    F.relu(
-                        float(margin)
-                        - (tau[pair_index[1]] - tau[pair_index[0]])
-                    ).mean()
+                different_node = node_ids[pair_index[0]] != node_ids[pair_index[1]]
+                temporal_skipped_same_node_pairs += int(
+                    (~different_node).sum().detach().cpu()
                 )
-                temporal_pairs += int(pair_index.shape[1])
+                if bool(different_node.any()):
+                    pair_index = pair_index[:, different_node]
+                    if pair_index.numel() == 0:
+                        selected_nodes += len(route)
+                        assignment_hits += hits
+                        continue
+                    temporal_losses.append(
+                        F.relu(
+                            1.0
+                            - (tau[pair_index[1]] - tau[pair_index[0]])
+                        ).sum()
+                    )
+                    temporal_pairs += int(pair_index.shape[1])
             selected_nodes += len(route)
             assignment_hits += hits
 
@@ -1212,18 +768,19 @@ class TaskMemory(nn.Module):
         loss_temporal = (
             torch.stack(temporal_losses).mean() if temporal_losses else zero
         )
-        local_semantic_diagnostic = (
-            torch.stack(local_semantic_diagnostics).mean()
-            if local_semantic_diagnostics
+        refined_semantic_diagnostic = (
+            torch.stack(refined_semantic_diagnostics).mean()
+            if refined_semantic_diagnostics
             else zero.detach()
         )
-        loss_total = loss_semantic + float(lambda_temporal) * loss_temporal
+        loss_total = loss_semantic + 0.5 * loss_temporal
         return {
             "loss": loss_total,
             "semantic": loss_semantic,
-            "semantic_local_diagnostic": local_semantic_diagnostic,
+            "semantic_refined_diagnostic": refined_semantic_diagnostic,
             "temporal": loss_temporal,
             "temporal_pairs": temporal_pairs,
+            "temporal_skipped_same_node_pairs": temporal_skipped_same_node_pairs,
             "samples": len(semantic_losses),
             "selected_nodes": selected_nodes,
             "assignment_hits": assignment_hits,

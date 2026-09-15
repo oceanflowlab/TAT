@@ -15,7 +15,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 def calibrated_pairwise_scores(sample, gamma_xz):
     """Return Eq. (27) scores at the Drop-DTW gamma used by this call.
 
-    ``pairwise_scores`` are stored at the training/reference gamma.  RAW
+    ``pairwise_scores`` are stored at the training/reference gamma.  the encoder-only branch
     Drop-DTW divides its logits by the caller's ``gamma_xz`` both during
     training and evaluation.  Applying the same ratio here prevents the
     guided branch from silently bypassing a validation-time gamma change.
@@ -36,11 +36,8 @@ def calibrated_pairwise_scores(sample, gamma_xz):
 
 def compute_all_costs(
     sample,
-    distractor,
     gamma_xz,
-    drop_cost_type,
     keep_percentile,
-    l2_nomalize=False,
     distinct_step_occurrences=False,
 ):
     """This function computes pairwise match and individual drop costs used in Drop-DTW
@@ -50,23 +47,12 @@ def compute_all_costs(
 
     sample: dict
         sample dictionary
-    distractor: torch.tensor of size [d] or None
-        Background class prototype. Only used if the drop cost is learnable.
-    distractor: torch.tensor of size [d] or None
-        Background class prototype. Only used if the drop cost is learnable.
-    drop_cost_type: str
-        The type of drop cost definition, i.g., learnable or logits percentile.
     keep_percentile: float in [0, 1]
-        if drop_cost_type == 'logit', defines drop (keep) cost threshold as logits percentile
-    l2_normalize: bool
-        wheather to normalize clip and step features before computing the costs
+        Defines the drop-cost threshold as a percentile of matching logits.
     """
 
     labels = sample['step_ids']
     step_features, frame_features = sample['step_features'], sample['frame_features']
-    if l2_nomalize:
-        frame_features = F.normalize(frame_features, p=2, dim=1)
-        step_features = F.normalize(step_features, p=2, dim=1)
     # Memory-guided samples may provide Eq. (27)'s prediction matrix P_u.
     # It is already cosine / temperature, so do not recompute a dot product
     # or apply gamma_xz a second time.
@@ -93,26 +79,10 @@ def compute_all_costs(
         )
     unique_sim = sim[unique_index]
 
-    if drop_cost_type == 'logit':
-        k = max([1, int(torch.numel(unique_sim) * keep_percentile)])
-        baseline_logit = torch.topk(unique_sim.reshape([-1]), k).values[-1].detach()
-        baseline_logits = baseline_logit.repeat([1, unique_sim.shape[1]])  # making it of shape [1, N]
-        sims_ext = torch.cat([unique_sim, baseline_logits], dim=0)
-    elif drop_cost_type == 'learn':
-        if pairwise_scores is not None:
-            tau = float(sample['pairwise_score_temperature'])
-            reference_gamma = sample.get('pairwise_score_reference_gamma')
-            if reference_gamma is not None:
-                tau *= float(gamma_xz) / float(reference_gamma)
-            distractor_sim = (
-                F.normalize(frame_features, p=2, dim=1)
-                @ F.normalize(distractor, p=2, dim=0)
-            ) / tau
-        else:
-            distractor_sim = frame_features @ distractor
-        sims_ext = torch.cat([unique_sim, distractor_sim[None, :]], dim=0)
-    else:
-        assert False, f"No such drop mode {drop_cost_type}"
+    k = max([1, int(torch.numel(unique_sim) * keep_percentile)])
+    baseline_logit = torch.topk(unique_sim.reshape([-1]), k).values[-1].detach()
+    baseline_logits = baseline_logit.repeat([1, unique_sim.shape[1]])
+    sims_ext = torch.cat([unique_sim, baseline_logits], dim=0)
 
     unique_softmax_sims = torch.nn.functional.softmax(
         sims_ext / score_temperature, dim=0

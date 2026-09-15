@@ -1,5 +1,4 @@
 import argparse
-import csv
 import json
 import math
 import os
@@ -159,15 +158,10 @@ def load_descriptions(path):
     return {int(key): str(value) for key, value in payload["steps_to_descriptions"].items()}
 
 
-def load_held_out_ids(path):
-    with open(path, newline="") as handle:
-        return {int(row["task_id"]) for row in csv.DictReader(handle)}
-
-
 def build_step_variants(task_id, step_id, indexed_records, budget, descriptions, args):
-    raw_visual = np.stack(
+    source_visual = np.stack(
         [
-            as_numpy(feature_value(record, "raw_visual_feature", "visual_feature"))
+            as_numpy(feature_value(record, "source_visual_feature", "visual_feature"))
             for _, record in indexed_records
         ]
     )
@@ -177,10 +171,10 @@ def build_step_variants(task_id, step_id, indexed_records, budget, descriptions,
         dtype=np.float32,
     )[:, None]
 
-    # Balance modalities before concatenation.  The previous raw
+    # Balance modalities before concatenation. The previous unscaled
     # ``3 * temporal`` block commonly had a larger norm than the unit visual
     # vector, so variants were grouped mainly by time rather than appearance.
-    visual_for_clustering = l2_normalize(raw_visual)
+    visual_for_clustering = l2_normalize(source_visual)
     temporal_for_clustering = standardize_columns(temporal)
     phase_for_clustering = standardize_columns(phase)
     cluster_features = np.concatenate(
@@ -208,20 +202,20 @@ def build_step_variants(task_id, step_id, indexed_records, budget, descriptions,
         member_records = [record for _, record in members]
         member_visual = torch.stack(
             [
-                feature_value(record, "raw_visual_feature", "visual_feature").float()
+                feature_value(record, "source_visual_feature", "visual_feature").float()
                 for record in member_records
             ]
         )
         member_text = torch.stack(
             [
-                feature_value(record, "raw_text_feature", "text_feature").float()
+                feature_value(record, "source_text_feature", "text_feature").float()
                 for record in member_records
             ]
         )
         member_temporal = torch.stack(
             [record["temporal_feature"].float() for record in member_records]
         )
-        raw_visual_proto, retained_visual_indices = trimmed_visual_prototype(
+        visual_proto, retained_visual_indices = trimmed_visual_prototype(
             member_visual, args.prototype_trim_fraction
         )
         retained_visual = member_visual[retained_visual_indices]
@@ -231,10 +225,10 @@ def build_step_variants(task_id, step_id, indexed_records, budget, descriptions,
             "canonical_step_id": step_id,
             "variant_id_within_step": variant_id,
             "step_text": descriptions.get(step_id),
-            "raw_text_proto": member_text.mean(dim=0),
-            "raw_text_variance": member_text.var(dim=0, unbiased=False),
-            "raw_visual_proto": raw_visual_proto,
-            "raw_visual_variance": retained_visual.var(dim=0, unbiased=False),
+            "text_proto": member_text.mean(dim=0),
+            "text_variance": member_text.var(dim=0, unbiased=False),
+            "visual_proto": visual_proto,
+            "visual_variance": retained_visual.var(dim=0, unbiased=False),
             "visual_prototype_aggregation": "trimmed_spherical_mean",
             "visual_prototype_retained_count": int(retained_visual.shape[0]),
             "temporal_proto": temporal_median,
@@ -266,33 +260,27 @@ def build_step_variants(task_id, step_id, indexed_records, budget, descriptions,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--occurrences", required=True)
-    parser.add_argument("--steps_info", required=True)
-    parser.add_argument("--held_out_tasks_csv", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--summary", required=True)
-    parser.add_argument("--node_budget", type=int, default=50)
-    parser.add_argument("--min_support", type=int, default=3)
-    parser.add_argument("--temporal_weight", type=float, default=0.5)
-    parser.add_argument("--phase_weight", type=float, default=0.25)
-    parser.add_argument("--prototype_trim_fraction", type=float, default=0.2)
-    parser.add_argument("--seed", type=int, default=10)
-    parser.add_argument("--max_iter", type=int, default=100)
+    parser.add_argument(
+        "--occurrences",
+        default="outputs/coin_memory/coin_train_step_occurrences_pseudo.pt",
+    )
+    parser.add_argument("--steps_info", default="data/COIN/steps_info.pickle")
+    parser.add_argument("--output", default="outputs/coin_memory/task_memory_nodes.pt")
+    parser.add_argument(
+        "--summary", default="outputs/coin_memory/task_memory_nodes_summary.json"
+    )
     args = parser.parse_args()
-
-    if args.temporal_weight < 0.0 or args.phase_weight < 0.0:
-        parser.error("clustering modality weights must be non-negative")
-    if not 0.0 <= args.prototype_trim_fraction < 1.0:
-        parser.error("--prototype_trim_fraction must be in [0, 1)")
+    args.node_budget = 50
+    args.min_support = 3
+    args.temporal_weight = 0.5
+    args.phase_weight = 0.25
+    args.prototype_trim_fraction = 0.2
+    args.seed = 10
+    args.max_iter = 100
 
     payload = torch.load(args.occurrences, map_location="cpu")
     records = payload["records"]
     descriptions = load_descriptions(args.steps_info)
-    held_out_ids = load_held_out_ids(args.held_out_tasks_csv)
-    task_ids = {int(record["task_id"]) for record in records}
-    overlap = sorted(task_ids & held_out_ids)
-    if overlap:
-        raise ValueError(f"Held-out tasks leaked into memory construction: {overlap}")
 
     phases = add_occurrence_phase(records)
     grouped = defaultdict(list)
@@ -367,7 +355,6 @@ def main():
         "unmatched_occurrences_skipped": sum(
             not bool(record["is_matched"]) for record in records
         ),
-        "held_out_task_overlap": overlap,
         "global_min_node_support": min(supports),
         "global_max_node_support": max(supports),
         "tasks": task_summaries,
@@ -393,7 +380,6 @@ def main():
         f"Node support min/max: {summary['global_min_node_support']}/"
         f"{summary['global_max_node_support']}"
     )
-    print(f"Held-out overlap: {overlap}")
 
 
 if __name__ == "__main__":

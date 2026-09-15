@@ -27,7 +27,7 @@ def semantic_edges(nodes, topk):
     for step_id in step_ids:
         step_nodes = by_step[step_id]
         anchors.append(
-            torch.stack([nodes[node_id]["raw_text_proto"].float() for node_id in step_nodes]).mean(0)
+            torch.stack([nodes[node_id]["text_proto"].float() for node_id in step_nodes]).mean(0)
         )
     anchors = F.normalize(torch.stack(anchors), p=2, dim=1)
     similarity = anchors @ anchors.T
@@ -177,13 +177,18 @@ def add_temporal_statistics(edges, task_routes, min_temporal_support):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--occurrences", required=True)
-    parser.add_argument("--variants", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--summary", required=True)
-    parser.add_argument("--semantic_topk_steps", type=int, default=3)
-    parser.add_argument("--min_temporal_support", type=int, default=2)
+    parser.add_argument(
+        "--occurrences",
+        default="outputs/coin_memory/coin_train_step_occurrences_pseudo.pt",
+    )
+    parser.add_argument("--variants", default="outputs/coin_memory/task_memory_nodes.pt")
+    parser.add_argument("--output", default="outputs/coin_memory/task_memory_graph.pt")
+    parser.add_argument(
+        "--summary", default="outputs/coin_memory/task_memory_graph_summary.json"
+    )
     args = parser.parse_args()
+    args.semantic_topk_steps = 3
+    args.min_temporal_support = 2
 
     occurrence_payload = torch.load(args.occurrences, map_location="cpu")
     records = occurrence_payload["records"]
@@ -275,8 +280,8 @@ def main():
     summary = {
         "schema_version": 2,
         "construction": "multimodal_variant_graph",
-        "source_variant_file": os.path.abspath(args.variants),
-        "source_occurrence_file": os.path.abspath(args.occurrences),
+        "source_variant_file": args.variants,
+        "source_occurrence_file": args.occurrences,
         "semantic_topk_steps": args.semantic_topk_steps,
         "min_temporal_support": args.min_temporal_support,
         "num_tasks": len(graphs),

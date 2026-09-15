@@ -5,32 +5,30 @@ import pytorch_lightning as pl
 from datasets.loader import LMDB_Folder_Dataset
 from datasets.batching import BatchIdxSampler_Class, flatten_batch
 from datasets.data_utils import dict2tensor
-from utils.paths import CT_PATH, COIN_PATH, YC_PATH, ARA_PATH, MR_PATH
+from utils.paths import COIN_PATH
 
 
 class DataModule(pl.LightningDataModule):
-    def __init__(self, dataset_name, n_cls, batch_size):
+    def __init__(self, batch_size=16, videos_per_task=2):
         super().__init__()
-        if dataset_name == "COIN":
-            folder = COIN_PATH
-        elif dataset_name == "YouCook2":
-            folder = YC_PATH
-        elif dataset_name == "CrossTask":
-            folder = CT_PATH
-        elif dataset_name == "ARA":
-            folder = ARA_PATH
-        elif dataset_name == "MR":
-            folder = MR_PATH
-        else:
-            raise f"No such dataset {dataset_name}"
-        
-        self.lmdb_path = os.path.join(folder, "lmdb")
-        self.n_cls = n_cls
+        self.lmdb_path = os.path.join(COIN_PATH, "lmdb")
+        if not os.path.isdir(self.lmdb_path):
+            raise FileNotFoundError(
+                "COIN LMDB directory was not found at {}. "
+                "Set TAT_COIN_PATH to the extracted COIN feature directory "
+                "or place the features under data/COIN/.".format(self.lmdb_path)
+            )
+        self.n_cls = videos_per_task
         self.batch_size = batch_size
 
         self.train_dataset = LMDB_Folder_Dataset(self.lmdb_path, split="train", transform=dict2tensor)
         self.val_dataset = LMDB_Folder_Dataset(self.lmdb_path, split="val", transform=dict2tensor)
         self.test_dataset = LMDB_Folder_Dataset(self.lmdb_path, split="test", transform=dict2tensor)
+        if len(self.train_dataset) == 0:
+            raise RuntimeError(
+                "No COIN training samples were found under {}. "
+                "Please check that the directory contains per-task train LMDB files.".format(self.lmdb_path)
+            )
         print(len(self.train_dataset), len(self.val_dataset))
 
     def train_dataloader(self):

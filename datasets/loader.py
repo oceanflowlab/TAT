@@ -1,4 +1,3 @@
-import sys
 import os
 import numpy as np
 import lmdb
@@ -13,7 +12,6 @@ from os import path as osp
 from glob import glob
 from torch.utils.data import Dataset
 
-sys.path.append(osp.dirname(osp.dirname(osp.abspath(__file__))))  # add parent dir
 from datasets.data_utils import Time2FrameNumber
 
 
@@ -71,18 +69,10 @@ class LMDB_Folder_Dataset(Dataset):
 
 class LMDB_Class_Dataset(Dataset):
     def __init__(self, cls_folder, split="train", transform=None, truncate=0):
-
-        if "encodings" in cls_folder:
-            self.cls_id = None
-        else:
-            split_name = osp.basename(cls_folder.rstrip("/")).split("_")
-            if len(split_name) == 2:
-                self.cls_id = int(split_name[0])
-            else:
-                self.cls_id = int(split_name[1])
-        # self.cls_id = int(osp.basename(cls_folder.rstrip('/')).split('_')[1])
         lmdb_filename = osp.basename(cls_folder.rstrip("/")).replace("lmdb", split) + ".lmdb"
         db_path = osp.join(cls_folder, lmdb_filename)
+        self.db_path = db_path
+        self.cls_id = self._parse_cls_id(cls_folder, db_path, split)
         self.env = lmdb.open(
             db_path, subdir=osp.isdir(db_path), max_readers=1, readonly=True, lock=False, readahead=False, meminit=False
         )
@@ -116,6 +106,21 @@ class LMDB_Class_Dataset(Dataset):
         else:
             self.step_embeddings = {}
             self.step_descriptions = {}
+
+    @staticmethod
+    def _parse_cls_id(cls_folder, db_path, split):
+        if "encodings" in cls_folder:
+            return None
+        filename = osp.basename(db_path)
+        suffix = "_{}.lmdb".format(split)
+        if filename.endswith(suffix):
+            prefix = filename[: -len(suffix)]
+            if prefix.isdigit():
+                return int(prefix)
+        for token in osp.basename(cls_folder.rstrip("/")).split("_"):
+            if token.isdigit():
+                return int(token)
+        return None
 
     def __getitem__(self, idx):
         """
